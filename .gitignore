@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.tar
+*.mp4
+*.png
+.env
+.DS_Store
+dataset
+checkpoint 
+log 
+tensorboard
