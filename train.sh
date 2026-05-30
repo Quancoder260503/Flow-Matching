@@ -1,0 +1,15 @@
+CUDA_VISIBLE_DEVICES="0,1" python3 Main.py \
+    --model_version OTFlowMatchingCIFAR10_64x64 \
+    --train_mode ContOtFlowMatching \
+    --doc ContOTFlowMatchingCIFAR10_64x64 \
+    --resume_training False \
+    --model_channels 96 \
+    --image_size 64 \
+    --in_channels 3 \
+    --out_channels 3 \
+    --sampler heun \
+    --dataset CIFAR10 \
+    --skewed_timesteps True \
+    --train True \
+    --total_epochs 3000 \
+    --lr_scheduler linearLR 
