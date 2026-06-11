@@ -7,7 +7,8 @@ __pycache__/
 *.png
 .env
 .DS_Store
-dataset
+datasets
 checkpoint 
 log 
 tensorboard
+samples
