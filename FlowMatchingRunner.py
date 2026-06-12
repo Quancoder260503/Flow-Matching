@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import glob
 from Scheduler import ConditionalOptimalTransportScheduler 
 from ProbabilityPath import AffineProbabilityPath
-import Solver
+import ODESolver
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -64,7 +64,7 @@ class Runner(ABC):
     self.prepare_data() 
     self.prepare_model()                                        
 
-    self.prob_path = AffineProbabilityPath(scheduler=ConditionalOptimalTransportScheduler())
+    self.prob_path = AffineProbabilityPath(scheduler = ConditionalOptimalTransportScheduler())
 
     if is_main_process(rank):
       print('=' * 90)
@@ -360,15 +360,15 @@ class Runner(ABC):
 
   def get_ode_solver_class(self):
     if self.args.sampler == 'euler':
-      self.solver_class = Solver.EulerSolver
+      self.solver_class = ODESolver.EulerSolver
     elif self.args.sampler == 'mid_point':
-      self.solver_class = Solver.MidPointSolver
+      self.solver_class = ODESolver.MidPointSolver
     elif self.args.sampler == 'heun_2':
-      self.solver_class = Solver.Heun2Solver
+      self.solver_class = ODESolver.Heun2Solver
     elif self.args.sampler == 'heun_3':
-      self.solver_class = Solver.Heun3Solver
+      self.solver_class = ODESolver.Heun3Solver
     elif self.args.sampler == 'rk4':
-      self.solver_class = Solver.RungeKutta4Solver
+      self.solver_class = ODESolver.RungeKutta4Solver
     else : 
       raise NotImplementedError("ODE solver not implemented")
     
