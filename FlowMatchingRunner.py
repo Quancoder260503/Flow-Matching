@@ -8,12 +8,13 @@ import os
 import shutil 
 import tensorboardX
 import torch.optim as optim
-from torchvision.datasets import MNIST, CIFAR10, CIFAR100
+from torchvision.datasets import MNIST, CIFAR10, CIFAR100, STL10
 import torchvision.transforms as transforms 
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid 
 from PIL import Image 
 from Unet import Unet
+from Transformer import DiffusionTransformer
 from EMA import EMAHelper
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt 
@@ -25,6 +26,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from diffusers.models import AutoencoderKL
+from abc import ABC, abstractmethod 
+
+KL_AUTOENCODER_PRECISION = 0.18215
 
 
 def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):  
@@ -47,8 +52,7 @@ def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tens
   time  = 1 / (1 + sigma)
   return torch.clip(time, min = 0.0001, max = 1.0)
 
-class Runner(object):
-  
+class Runner(ABC):  
   def __init__(self, args, rank: int = 0, world_size: int = 1):
     self.args = args
     self.rank = rank                                 
@@ -57,40 +61,31 @@ class Runner(object):
     self.device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() \
     else torch.device("cpu")
 
-    self.prepare_data()                                         
+    self.prepare_data() 
+    self.prepare_model() 
+    self.get_ode_solver_class()                   
 
-    model = Unet(
-      image_size = self.args.image_size,
-      in_channels = self.args.in_channels,
-      model_channels = self.args.model_channels,
-      out_channels = self.args.out_channels,
-      num_residual_blocks = self.args.num_residual_blocks,
-      attention_resolutions = self.args.attention_resolution,
-      dropout = self.args.dropout,
-      channel_mult = self.args.channel_mult,
-      conv_resample = self.args.conv_resample,
-      dims = self.args.dims,
-      num_classes = self.args.num_classes,
-      num_attention_heads = self.args.num_attention_heads,
-      use_scale_shift_norm = self.args.use_scale_shift_norm,
-      residual_block_up_down = self.args.residual_block_up_down,
-      embedding_to_model_dim_ratio = self.args.embedding_to_model_dim_ratio,
-    ).to(self.device)                                        
-
-    if self.is_ddp:
-        self.model = DDP(model, device_ids=[rank], output_device=rank)
-    else:
-        self.model = model
-
-    self.prob_path = AffineProbabilityPath(scheduler=ConditionalOptimalTransportScheduler())
+    self.prob_path = AffineProbabilityPath(scheduler = ConditionalOptimalTransportScheduler())
 
     if is_main_process(rank):
       print('=' * 90)
       print("TOTAL PARAMS:")
       print(sum(p.numel() for p in self.model.parameters() if p.requires_grad))
 
-    self.optimizer    = self.get_optimizer(model_params = self.model.parameters())
+    self.optimizer = self.get_optimizer(model_params = self.model.parameters())
     self.lr_scheduler = self.get_lr_scheduler()
+
+    if self.args.rectified_flow:
+      map_loc = {"cuda:0": f"cuda:{rank}"} if self.is_ddp else None
+      states = torch.load(os.path.join(self.args.path, "checkpoint", \
+            f"{self.args.sampling_model_version}.pth"), map_location = map_loc)
+      
+      self.get_sampling_model()
+      self.sampling_model.load_state_dict(states[0])
+      sampling_ema_helper = EMAHelper(mu = self.args.ema_rate)
+      sampling_ema_helper.load_state_dict(states[5])
+      sampling_ema_helper.ema(self.sampling_model) 
+      self.sampling_model.eval()
 
     if is_main_process(rank):
       print('=' * 90)
@@ -109,13 +104,63 @@ class Runner(object):
       self.optimizer.load_state_dict(states[1])
       self.lr_scheduler.load_state_dict(states[2])
       self.start_epoch = states[3]
-      self.step        = states[4]
+      self.step = states[4]
       self.ema_helper.load_state_dict(states[5])
+
+
+  def get_sampling_model(self):
+    if self.args.sampling_model == 'unet': 
+      sampling_model = Unet(
+        image_size = self.args.image_size,
+        in_channels = self.args.in_channels,
+        model_channels = self.args.sampling_model_channels,
+        out_channels = self.args.out_channels,
+        num_residual_blocks = self.args.sampling_num_residual_blocks,
+        attention_resolutions = self.args.sampling_attention_resolution,
+        dropout = self.args.dropout,
+        channel_mult = self.args.sampling_channel_mult,
+        conv_resample = self.args.sampling_conv_resample,
+        dims = self.args.dims,
+        num_classes = self.args.num_classes,
+        num_attention_heads = self.args.sampling_num_attention_heads,
+        use_scale_shift_norm = self.args.sampling_use_scale_shift_norm,
+        residual_block_up_down = self.args.sampling_residual_block_up_down,
+        embedding_to_model_dim_ratio = self.args.sampling_embedding_to_model_dim_ratio,
+      ).to(self.device)                                        
+
+
+    elif self.args.sampling_model == 'transformer':
+      sampling_model = DiffusionTransformer(
+        input_size = self.args.latent_input_size, 
+        patch_size = self.args.patch_size, 
+        hidden_size = self.args.sampling_transformer_hidden_size, 
+        num_transformer_layers = self.args.sampling_num_transformer_layers,
+        num_attention_heads = self.args.sampling_transformer_num_attention_heads, 
+        ffn_dim = self.args.sampling_transformer_ffn_dim, 
+        activation = self.args.sampling_activation, 
+        learn_sigma = self.args.sampling_learn_sigma, 
+        dropout_prob = self.args.dropout, 
+        frequency_embedding_size = self.args.sampling_frequency_embedding_size, 
+        num_classes = self.args.num_classes, 
+        device = self.device,  
+      ).to(self.device)            
+    else : 
+      raise NotImplementedError('Sampling Model Architecture unknown')
+
+
+    if self.is_ddp:
+      self.sampling_model = DDP(sampling_model, device_ids = [self.rank], output_device = self.rank)
+    else:
+      self.sampling_model = sampling_model
+
 
   @property
   def raw_model(self):
     return self.model.module if self.is_ddp else self.model
-
+  
+  @abstractmethod
+  def prepare_model(self):
+    pass 
 
   def get_optimizer(self, model_params):
     if self.args.optimizer == 'AdamW':
@@ -174,17 +219,16 @@ class Runner(object):
      raise NotImplementedError('Learning Rate Scheduler not supported for now')
 
   def prepare_data(self):
-    cifar_normalize = transforms.Normalize(mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5])
+    rgb_normalize  = transforms.Normalize(mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5])
     mnist_normalize = transforms.Normalize(mean = [0.5], std = [0.5])
 
-    def make_transforms(image_size, normalize, random_flip = False):
-      base = [
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        normalize,
-      ]
+    def make_transforms(image_size, normalize, random_flip = False, center_crop = False):
+      base = [transforms.Resize((image_size, image_size))]
+      if center_crop:
+        base.append(transforms.CenterCrop(image_size))
       if random_flip:
-        base.insert(1, transforms.RandomHorizontalFlip(p = 0.5))
+        base.append(transforms.RandomHorizontalFlip(p=0.5))
+      base += [transforms.ToTensor(), normalize]
       return transforms.Compose(base)
 
     self.inverse_data_transform = transforms.Compose([
@@ -193,59 +237,74 @@ class Runner(object):
       transforms.ToPILImage(),
     ])
 
+    def resolve_root(name):
+      return os.path.join(self.args.path, 'datasets', name)
+
+    def check_download(root, name):
+      if os.path.isdir(root) and os.listdir(root):
+        return False                 
+      if not self.args.download:
+        raise RuntimeError(
+          f"{name} dataset directory '{root}' is missing or empty and download is disabled."
+        )
+      return True                
+
     if self.args.dataset in ('CIFAR10', 'CIFAR100'):
       is_cifar100  = self.args.dataset == 'CIFAR100'
       DatasetClass = CIFAR100 if is_cifar100 else CIFAR10
-    
-      cifar_root = os.path.join(self.args.path, 'datasets', 'cifar100' if is_cifar100 else 'cifar10')
-      download_dataset = self.args.download
-      if os.path.isdir(cifar_root) and os.listdir(cifar_root):
-        download_dataset = False
-      elif not self.args.download:
-        raise RuntimeError(
-          f"{self.args.dataset} dataset directory '{cifar_root}' is missing or empty and download is disabled."
-        )
-    
+      root         = resolve_root('cifar100' if is_cifar100 else 'cifar10')
+      download     = check_download(root, self.args.dataset)
+
       train_dataset = DatasetClass(
-        root = cifar_root, 
-        train = True,  
-        download = download_dataset,
-        transform = make_transforms(self.args.image_size, cifar_normalize, self.args.random_flip),
+        root = root, 
+        train = True, 
+        download = download,
+        transform = make_transforms(self.args.image_size, rgb_normalize, self.args.random_flip),
+      )
+      test_dataset = DatasetClass(
+        root = root, 
+        train = False, 
+        download = download,
+        transform = make_transforms(self.args.image_size, rgb_normalize),
       )
 
-      test_dataset = DatasetClass(
-        root = cifar_root, 
-        train = False, 
-        download = download_dataset,
-        transform = make_transforms(self.args.image_size, cifar_normalize),
-      )
-       
     elif self.args.dataset == 'MNIST':
-      mnist_root = os.path.join(self.args.path, 'datasets', 'mnist')
-      download_dataset = self.args.download
-      if os.path.isdir(mnist_root) and os.listdir(mnist_root):
-        download_dataset = False
-      elif not self.args.download:
-        raise RuntimeError(
-          f"MNIST dataset directory '{mnist_root}' is missing or empty and download is disabled."
-        )
-    
+      root = resolve_root('mnist')
+      download = check_download(root, 'MNIST')
+
       train_dataset = MNIST(
-        root = mnist_root, 
-        train = True,  
-        download = download_dataset,
+        root = root, 
+        train = True, 
+        download = download,
         transform = make_transforms(self.args.image_size, mnist_normalize, self.args.random_flip),
       )
       test_dataset = MNIST(
-        root = mnist_root, 
+        root = root, 
         train = False, 
-        download = download_dataset,
+        download = download,
         transform = make_transforms(self.args.image_size, mnist_normalize),
       )
-    else:
-      raise NotImplementedError('Dataset not supported')
 
-    if self.is_ddp:                                                 
+    elif self.args.dataset == 'STL10':
+      root = resolve_root('stl10')
+      download = check_download(root, 'STL10')
+
+      train_dataset = STL10(
+        root = root, 
+        split = 'unlabeled', 
+        download = download,
+        transform = make_transforms(self.args.image_size, rgb_normalize, self.args.random_flip, center_crop = True),
+      )
+      test_dataset = STL10(
+        root = root, 
+        split = 'test', 
+        download = False,
+        transform = make_transforms(self.args.image_size, rgb_normalize, center_crop=True),
+      )
+    else:
+      raise ValueError(f"Unsupported dataset: '{self.args.dataset}'")
+
+    if self.is_ddp:
       self.train_sampler = DistributedSampler(
         train_dataset,
         num_replicas = self.world_size,
@@ -273,9 +332,16 @@ class Runner(object):
       num_workers = self.args.num_workers,
     )
 
-
   def train(self):
     self.train_vector_field()
+
+  @abstractmethod
+  def encode_input(self, img):
+    pass 
+
+  @abstractmethod 
+  def decode_output(self, img):
+    pass 
 
   def train_vector_field(self):
     if is_main_process(self.rank):                             
@@ -299,13 +365,15 @@ class Runner(object):
         self.model.train()
 
         img = img.to(self.device)                   
+        
+        
         batch_size = img.shape[0]
-
         t = skewed_timestep_sample(batch_size, device = self.device) if self.args.skewed_timesteps \
              else torch.rand(batch_size, device = self.device)
+        
+        gaussian_noise, img = self.encode_input(img)
 
-        noise = torch.randn_like(img)
-        path_sample = self.prob_path.sample(t = t, x_0 = noise, x_1 = img)
+        path_sample = self.prob_path.sample(t = t, x_0 = gaussian_noise, x_1 = img)
         x_t, dx_t = path_sample.x_t, path_sample.dx_t
 
         loss = torch.pow(self.model(x_t, t) - dx_t, 2).mean()
@@ -321,42 +389,47 @@ class Runner(object):
         self.ema_helper.update(self.raw_model)                 
 
         if is_main_process(self.rank):                         
-            tensorboard_logger.add_scalar('loss', loss.item(), global_step = self.step)
-            logging.info(f"step: {self.step}, loss: {loss.item()}")
+          tensorboard_logger.add_scalar('loss', loss.item(), global_step = self.step)
+          logging.info(f"step: {self.step}, loss: {loss.item()}")
 
-            if self.step % 100 == 0:
-              self.model.eval()
-              try:
-                test_img, _ = next(test_iter)
-              except StopIteration:
-                test_iter = iter(self.test_loader)
-                test_img, _ = next(test_iter)
+          if self.step % 100 == 0:
+            self.model.eval()
+            try:
+              test_img, _ = next(test_iter)
+            except StopIteration:
+              test_iter = iter(self.test_loader)
+              test_img, _ = next(test_iter)
 
-              test_img = test_img.to(self.device)
-              with torch.no_grad():
-                t_test = skewed_timestep_sample(test_img.shape[0], device=self.device) \
-                    if self.args.skewed_timesteps else torch.rand(test_img.shape[0], device=self.device)
-                noise_t = torch.randn_like(test_img)
-                ps = self.prob_path.sample(t = t_test, x_0 = noise_t, x_1 = test_img)
-                test_loss = torch.pow(self.model(ps.x_t, t_test) - ps.dx_t, 2).mean()
-                tensorboard_logger.add_scalar('test_loss', test_loss, global_step = self.step)
-                print(f"step: {self.step}, test_loss: {test_loss.item()}")
+            test_img = test_img.to(self.device)
 
-            if self.step % self.args.snapshot_freq == 0:
-              states = [
-                self.raw_model.state_dict(),              
-                self.optimizer.state_dict(),
-                self.lr_scheduler.state_dict(),
-                epoch,
-                self.step,
-                self.ema_helper.state_dict(),
-              ]
-              torch.save(states, os.path.join(self.args.path, 'checkpoint', f'{self.args.model_version}.pth'))
+            gaussian_noise_t, test_img = self.encode_input(test_img)
+            
+            with torch.no_grad():
+              t_test = skewed_timestep_sample(test_img.shape[0], device=self.device) \
+                  if self.args.skewed_timesteps else torch.rand(test_img.shape[0], device=self.device)
+    
+              ps = self.prob_path.sample(t = t_test, x_0 = gaussian_noise_t, x_1 = test_img)
+              test_loss = torch.pow(self.model(ps.x_t, t_test) - ps.dx_t, 2).mean()
+              tensorboard_logger.add_scalar('test_loss', test_loss, global_step = self.step)
+              print(f"step: {self.step}, 'train_loss : {loss.item()}, test_loss: {test_loss.item()}")
+
+          if self.step % self.args.snapshot_freq == 0:
+            states = [
+              self.raw_model.state_dict(),              
+              self.optimizer.state_dict(),
+              self.lr_scheduler.state_dict(),
+              epoch,
+              self.step,
+              self.ema_helper.state_dict(),
+            ]
+            torch.save(states, os.path.join(self.args.path, 'checkpoint', f'{self.args.model_version}.pth'))
 
       lr = self.optimizer.param_groups[0]["lr"]            
       if is_main_process(self.rank):                           
         print(f"Epoch: {epoch}, step: {self.step}, Training Loss: {np.mean(losses)}, Learning Rate: {lr}")  
       self.lr_scheduler.step()
+
+
 
   def get_ode_solver_class(self):
     if self.args.sampler == 'euler':
@@ -372,19 +445,21 @@ class Runner(object):
     else : 
       raise NotImplementedError("ODE solver not implemented")
     
-    
-    
+  @abstractmethod     
+  def get_sampling_shape(self):
+    pass 
+
   @torch.no_grad()
   def sample(self):
     os.makedirs(self.args.image_folder, exist_ok = True)
+    os.makedirs(os.path.join(self.args.image_folder, self.args.dataset, \
+                self.args.model), exist_ok = True) 
     img_id = 0
     num_rounds = (self.args.num_samples - img_id) // self.args.sampling_batch_size
     self.ema_helper.ema(self.raw_model)
-    self.get_ode_solver_class()
     self.model.eval()
     for _ in tqdm.tqdm(range(num_rounds), desc = 'Generating img for evaluation'):
-      shape = (self.args.sampling_batch_size, self.args.in_channels, \
-               self.args.image_size, self.args.image_size)
+      shape = self.get_sampling_shape()
       gaussian_noise = torch.randn(shape).to(self.args.device)
       ode_solver = self.solver_class(
         velo_func = self.model, 
@@ -392,16 +467,18 @@ class Runner(object):
       )
       timesteps = torch.linspace(0, 1.0, self.args.num_sampling_steps + 1)
       samples = ode_solver.integrate(timesteps)
-
+      
+      decode_samples = [self.decode_output(sample) for sample in samples]
+  
       for i in range(self.args.sampling_batch_size):
-        img = self.inverse_data_transform(samples[-1][i])
+        img = self.inverse_data_transform(decode_samples[-1][i])
 
         fig, ax = plt.subplots()
         ax.axis('off')
         frames = []
-        for t_idx, sample in enumerate(samples):
+        for t_idx, sample in enumerate(decode_samples):
           noise_img = self.inverse_data_transform(sample[i].cpu())
-          artist = ax.imshow(np.array(noise_img), animated = True)
+          artist = ax.imshow(np.array(noise_img), animated=True)
           label = ax.text(0.5, -0.05, f"t = {t_idx / self.args.num_sampling_steps:.3f}",
             transform = ax.transAxes, 
             ha = 'center', 
@@ -411,7 +488,8 @@ class Runner(object):
         if img_id < 100 : 
           anim = animation.ArtistAnimation(fig, frames, interval = 50, blit = True, repeat_delay = 1000)
           anim.save(
-            os.path.join(self.args.image_folder, f'Flow_Matching_{img_id}.gif'),
+            os.path.join(self.args.image_folder, self.args.dataset, \
+                         self.args.model, f'Flow_Matching_{img_id}.gif'),
             writer = 'pillow',
           )
         plt.close(fig)
@@ -420,15 +498,129 @@ class Runner(object):
         if np_img.ndim == 3 and np_img.shape[2] == 3:
           np_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
         
-        cv2.imwrite(os.path.join(self.args.image_folder, f'{img_id}.png'), np_img)
+        cv2.imwrite(os.path.join(self.args.image_folder, self.args.dataset, \
+                                 self.args.model, f'{img_id}.png'), np_img)
         img_id += 1
 
+
+
+class UnetRunner(Runner):
+  def __init__(self, args, rank = 0, world_size = 1):
+    super().__init__(args, rank, world_size)
+  
+  def prepare_model(self):
+    model = Unet(
+      image_size = self.args.image_size,
+      in_channels = self.args.in_channels,
+      model_channels = self.args.model_channels,
+      out_channels = self.args.out_channels,
+      num_residual_blocks = self.args.num_residual_blocks,
+      attention_resolutions = self.args.attention_resolution,
+      dropout = self.args.dropout,
+      channel_mult = self.args.channel_mult,
+      conv_resample = self.args.conv_resample,
+      dims = self.args.dims,
+      num_classes = self.args.num_classes,
+      num_attention_heads = self.args.num_attention_heads,
+      use_scale_shift_norm = self.args.use_scale_shift_norm,
+      residual_block_up_down = self.args.residual_block_up_down,
+      embedding_to_model_dim_ratio = self.args.embedding_to_model_dim_ratio,
+    ).to(self.device)                                        
+
+    if self.is_ddp:
+      self.model = DDP(model, device_ids = [self.rank], output_device = self.rank)
+    else:
+      self.model = model
+
+  def encode_input(self, img):
+    gaussian_noise = torch.randn_like(img).to(self.args.device)
+    if self.args.rectified_flow : 
+      with torch.no_grad():
+        ode_solver = self.solver_class(
+          velo_func = self.sampling_model, 
+          y_0 = gaussian_noise, 
+        )
+        timesteps = torch.linspace(0, 1.0, self.args.num_sampling_steps + 1.)
+        samples = ode_solver.integrate(timesteps)
+        return gaussian_noise, samples
+    else : 
+      return gaussian_noise, img 
+  
+  def decode_output(self, img):
+    return img 
+
+  def get_sampling_shape(self): 
+    return (self.args.sampling_batch_size, self.args.in_channels, self.args.img_size, self.args.img_size)
+
+
+class DiTransformerRunner(Runner):
+  def __init__(self, args, rank = 0, world_size = 1):
+    super().__init__(args, rank, world_size)
+    if is_main_process(rank):
+      print('=' * 90)
+      print('Loading Kullback Leiber autoencoder as the backbone')
+    self.autoencoder_kl = AutoencoderKL.from_pretrained\
+    (f"stabilityai/sd-vae-ft-{self.args.vae_path}").to('cuda')
+    self.autoencoder_kl.eval()
+
+    if is_main_process(rank):
+      print('Finish loading')
+  
+  def prepare_model(self):
+    model = DiffusionTransformer(
+      input_size = self.args.latent_input_size, 
+      patch_size = self.args.patch_size, 
+      in_channels = self.args.in_channels, 
+      hidden_size = self.args.transformer_hidden_size, 
+      num_transformer_layers = self.args.num_transformer_layers,
+      num_attention_heads = self.args.transformer_num_attention_heads, 
+      ffn_dim = self.args.transformer_ffn_dim, 
+      activation = self.args.activation, 
+      learn_sigma = self.args.learn_sigma, 
+      dropout_prob = self.args.dropout, 
+      frequency_embedding_size = self.args.frequency_embedding_size, 
+      num_classes = self.args.num_classes, 
+      device = self.device,  
+
+    ).to(self.device)              
+
+    if self.is_ddp:
+      self.model = DDP(model, device_ids = [self.rank], output_device = self.rank)
+    else:
+      self.model = model
+  
+  @torch.no_grad()
+  def encode_input(self, img):
+    latent_z = self.autoencoder_kl.encode(img).latent_dist.sample().mul(KL_AUTOENCODER_PRECISION)
+    gaussian_noise = torch.randn_like(latent_z)
+
+    if self.args.rectified_flow:
+      ode_solver = self.solver_class(
+        velo_func = self.sampling_model,
+        y_0 = gaussian_noise,
+      )
+      timesteps = torch.linspace(0, 1.0, self.args.num_sampling_steps + 1)
+      samples = ode_solver.integrate(timesteps)
+      return gaussian_noise, samples[-1]
+    else:
+      return gaussian_noise, latent_z
+
+  def decode_output(self, img):
+    with torch.no_grad():
+      output = self.autoencoder_kl.decode(img / KL_AUTOENCODER_PRECISION).sample
+    return output
+  
+
+  def get_sampling_shape(self): 
+    return (self.args.sampling_batch_size, self.args.in_channels, self.args.latent_input_size, self.args.latent_input_size)
+  
 
 
 def ddp_worker(rank: int, world_size: int, args):
   setup_ddp(rank, world_size)
   try:
-    runner = Runner(args, rank = rank, world_size = world_size)
+    runner = UnetRunner(args, rank = rank, world_size = world_size) if args.model == 'unet'\
+        else DiTransformerRunner(args, rank = rank, world_size = world_size)
     if args.train:
       runner.train()
     else:
@@ -445,7 +637,7 @@ def launch(args):
   if world_size > 1:
     mp.spawn(ddp_worker, args = (world_size, args), nprocs = world_size, join = True)
   else:
-    runner = Runner(args, rank = 0, world_size = 1)
+    runner = UnetRunner(args) if args.model == 'unet' else DiffusionTransformer(args)
     if args.train:
       runner.train()
     else:

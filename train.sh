@@ -1,16 +1,20 @@
 python3 Main.py \
-    --model_version OTFlowMatchingCIFAR10_64x64 \
+    --model_version TransformerOTFlowMatchingCIFAR10_64x64 \
+    --model transformer \
+    --rectified_flow False \
     --train_mode ContOtFlowMatching \
-    --doc ContOTFlowMatchingCIFAR10_64x64 \
+    --doc TransformerContOTFlowMatchingCIFAR10_64x64 \
     --resume_training True \
     --model_channels 96 \
-    --image_size 64 \
+    --image_size 128 \
     --batch_size 32 \
-    --in_channels 3 \
-    --out_channels 3 \
-    --sampler heun \
+    --in_channels 4 \
+    --out_channels 4 \
+    --sampler heun_2 \
     --dataset CIFAR10 \
     --skewed_timesteps True \
     --train True \
     --total_epochs 2000 \
-    --lr_scheduler linearLR 
+    --latent_input_size 16 \
+    --patch_size 2 \
+    --lr_scheduler linearLR \

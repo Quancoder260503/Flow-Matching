@@ -5,6 +5,13 @@ import torch.nn as nn
 import torch 
 import torch.nn.functional as F 
 
+'''
+=====================================
+Unet as the bottleneck 
+=====================================
+'''
+
+
 def zero_module(module):
  """
  Zero out the parameters of a module and return it.

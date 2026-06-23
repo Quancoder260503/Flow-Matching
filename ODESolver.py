@@ -207,3 +207,4 @@ class AdaptiveStepsizeEventODESolver(AdaptiveStepsizeODESolver, abc.ABCMeta):
     event_time, y_1 = self.advance_until_event(event_fn)
     solution = torch.stack([self.y_0, y_1], dim=0)
     return event_time, solution
+
