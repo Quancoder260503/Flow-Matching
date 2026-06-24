@@ -1,6 +1,8 @@
 import argparse
 import yaml
 from FlowMatchingRunner import launch
+import json 
+import os 
 
 def str2bool(value):
  if isinstance(value, bool):
@@ -17,6 +19,7 @@ def get_parser():
   parser = argparse.ArgumentParser()
   # General Info  
   parser.add_argument('--train', type = str2bool, required = True)
+  parser.add_argument('--rectified_flow', type = str2bool, required = True)
   parser.add_argument('--model', type = str, required = True, help = 'Unet or Transformer ?')
   parser.add_argument('--model_version', type = str, required = True)
   parser.add_argument('--train_mode', type = str, required = True)
@@ -101,11 +104,58 @@ def get_parser():
   parser.add_argument('--image_folder',        default = 'samples', type = str, required = False)
   parser.add_argument('--num_sampling_steps', default = 50, type = int, required = False)
 
+  parser.add_argument('--sampling_model', default = 'unet', type = str, required = False)
+  
+  args = parser.parse_args() 
+  params = vars(args)
 
-  return parser
+  if args.train:
+    if args.rectified_flow :
+      config_path = os.path.join('config', params['model_version'] + 'config.json')
+      params['sampling_model_version'] =  params['model_version'][:-10] # Convention, rectified models prefix ends with {sampling_model}_rectified.
+      sampler_config_path = os.path.join('config', params['sampling_model_version'] + 'config.json')
+
+      with open(sampler_config_path, 'r') as f:
+        saved_params = json.load(f)
+      
+      for key, value in saved_params.items():
+        if key not in [
+          'num_residual_blocks', 
+          'attention_resolution', 
+          'model_channels', 
+          'channel_mult', 
+          'conv_resample', 
+          'num_attention_heads', 
+          'use_scale_shift_norm', 
+          'residual_block_up_down', 
+          'embedding_to_model_dim_ratio',
+          'transformer_hidden_size', 
+          'num_transformer_layers', 
+          'transformer_num_attention_heads', 
+          'transformer_ffn_dim', 
+          'activation', 
+          'learn_sigma', 
+          'frequency_embedding_size'
+        ]: 
+          continue 
+        setattr(args, 'sampling_' + key, value)
+
+
+
+    with open(config_path, 'w') as f:
+      json.dump(params, f, indent = 4)
+  else:
+    config_path = os.path.join('config', params['model_version'] + 'config.json')
+    with open(config_path, 'r') as f:
+      saved_params = json.load(f)
+    for key, value in saved_params.items():
+      if key in ['num_samples', 'sampling_batch_size', 'num_sampling_steps', 'resume_training', 'sampler', 'train']:
+        continue 
+      setattr(args, key, value)
+
+  return args 
 
 
 if __name__ == '__main__':
-  parser = get_parser()
-  args = parser.parse_args()
+  args = get_parser()
   launch(args)

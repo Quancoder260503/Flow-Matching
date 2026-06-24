@@ -258,6 +258,8 @@ class DiffusionTransformer(nn.Module):
       bias = True, 
     )
     
+    if self.num_classes is not None : 
+      self.label_embedding = nn.Embedding(self.num_classes, self.time_embedding_dim)
 
     self.frequency_embedding = nn.Sequential(
       nn.Linear(self.frequency_embedding_size, self.hidden_size), 
@@ -320,6 +322,10 @@ class DiffusionTransformer(nn.Module):
     nn.init.constant_(self.out.linear.weight, 0)
     nn.init.constant_(self.out.linear.bias, 0)
 
+    if self.label_embedding is not None : 
+      nn.init.xavier_uniform_(self.label_embedding.weight, std = 0.02)
+
+
 
   def unpatchify(self, x):
     """
@@ -344,8 +350,8 @@ class DiffusionTransformer(nn.Module):
     conditional_embedding = self.frequency_embedding(\
       timestep_embedding(timesteps, self.frequency_embedding_size)) # (B, hidden_size)
     
-    if self.num_classes is not None : 
-      labels_embedding = self.class_embedding(labels)
+    if self.num_classes is not None and labels is not None : 
+      labels_embedding = self.label_embedding(labels)
       conditional_embedding = conditional_embedding + labels_embedding
     
     for block in self.blocks:

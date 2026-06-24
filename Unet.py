@@ -517,11 +517,9 @@ class Unet(nn.Module):
     )
 
   def forward(self, inp, timesteps, y = None): 
-    if self.num_classes is not None : 
-      assert y is not None, "The condition y cannot be None when num_classes is specified"
     
     embedding = self.time_embedding(timestep_embedding(timesteps, self.model_channels))
-    if self.num_classes is not None : 
+    if self.num_classes is not None and y is not None: 
       embedding = embedding + self.label_embedding(y)
 
     output_stack = [] 
