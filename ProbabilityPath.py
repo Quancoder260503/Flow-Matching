@@ -1,5 +1,5 @@
 """
-Code borrowed from 
+Code re-implemented from 
 https://github.com/facebookresearch/flow_matching/blob/main/flow_matching/path/path_sample.py
 """
 

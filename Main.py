@@ -139,9 +139,10 @@ def get_parser():
         ]: 
           continue 
         setattr(args, 'sampling_' + key, value)
-
-
-
+      
+    else : 
+      config_path = os.path.join('config', params['model_version'] + 'config.json')
+    
     with open(config_path, 'w') as f:
       json.dump(params, f, indent = 4)
   else:

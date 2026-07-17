@@ -108,6 +108,8 @@ class DistanceBlock(object):
       self.features_batch_1 = tf.placeholder(tf.float32, shape = [None, None])
       self.features_batch_2 = tf.placeholder(tf.float32, shape = [None, None])
 
+      
+
 
 def batch_pairwise_distance(batch_a, batch_b):
   with tf.variable_scope('pairwise_dist_block'):

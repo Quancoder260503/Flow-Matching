@@ -160,7 +160,7 @@ class MultiheadAttention(nn.Module):
     attn_out = attn_out.contiguous().view(batch_size, self.num_heads, num_channels, -1) 
     attn_out = attn_out.contiguous().view(batch_size, self.num_heads * num_channels, -1)
     return attn_out 
-
+  
     
 class AttentionBlock(nn.Module):
   def __init__(self, channels, num_attention_heads):
@@ -183,9 +183,245 @@ class AttentionBlock(nn.Module):
     out = inp + out 
     out = out.contiguous().view(b, c, *spatial) 
     return out 
+    
 
+class TransformerSelfAttentionBlock(nn.Module): 
+  def __init__(
+    self,
+    model_dim = 512, 
+    num_heads = 8, 
+    dims_per_head = 64, 
+    dropout = 0.2, 
+    bias_term = False
+  ): 
+    super(TransformerSelfAttentionBlock, self).__init__()
+    self.model_dim = model_dim 
+    self.num_heads = num_heads 
+    self.dims_per_head = dims_per_head
+    self.dropout = nn.Dropout(p = dropout)
+    self.scale = dims_per_head ** (-0.5)
 
+    self.proj_query = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term) 
+    self.proj_key = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term)
+    self.proj_value = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term)
 
+    self.proj_out = nn.Linear(dims_per_head * num_heads, model_dim)
+
+  def forward(self, x): 
+    B, T, _ = x.shape 
+    residual = x
+    query = self.proj_query(residual)
+    query = query.contiguous().view(B, T, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3)
+    query = query.contiguous().view(-1, T, self.dims_per_head)
+    key = self.proj_key(residual) 
+    key = key.contiguous().view(B, T, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3)
+    key = key.contiguous().view(-1, T, self.dims_per_head)
+    value = self.proj_value(residual)
+    value = value.contiguous().view(B, T, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3) 
+    value = value.contiguous().view(-1, T, self.dims_per_head)
+
+    attn_map = torch.bmm(query, key.permute(0, 2, 1)) * self.scale 
+    attn_map = torch.softmax(attn_map, dim = -1) 
+    attn_map = torch.bmm(attn_map, value) # (B * self.num_heads, T, self.dims_per_head)
+    attn_map = attn_map.contiguous().view(B, self.num_heads, T, self.dims_per_head).permute(0, 2, 1, 3) 
+    attn_map = attn_map.contiguous().view(B, T, -1)
+    result = self.proj_out(attn_map)
+    result = self.dropout(result)
+    return result
+  
+
+class TransformerCrossAttentionBlock(nn.Module): 
+  def __init__(
+    self, 
+    model_dim = 512, 
+    context_dim = 256,  
+    num_heads = 8, 
+    dims_per_head = 64, 
+    dropout = 0.2, 
+    bias_term = False
+  ): 
+    super(TransformerCrossAttentionBlock, self).__init__() 
+    self.model_dim = model_dim 
+    self.context_dim = context_dim 
+    self.num_heads = num_heads 
+    self.dims_per_head = dims_per_head 
+    self.dropout = nn.Dropout(dropout)
+    self.scale = dims_per_head ** (-0.5)
+    
+    self.proj_query = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term) 
+    self.proj_key = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term)
+    self.proj_value = nn.Linear(model_dim, dims_per_head * num_heads, bias = bias_term)
+
+    self.proj_out = nn.Linear(dims_per_head * num_heads, model_dim)
+
+  def forward(self, x, context, mask = None): 
+    B, q_len, _ = x.shape 
+    _, k_len, _ = context.shape 
+    query = self.proj_query(x)
+    query = query.contiguous().view(B, q_len, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3)
+    query = query.contiguous().view(-1, q_len, self.dims_per_head)
+    key = self.proj_key(context) 
+    key = key.contiguous().view(B, k_len, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3)
+    key = key.contiguous().view(-1, k_len, self.dims_per_head)
+    value = self.proj_value(context)
+    value = value.contiguous().view(B, k_len, self.num_heads, self.dims_per_head).permute(0, 2, 1, 3) 
+    value = value.contiguous().view(-1, k_len, self.dims_per_head)
+
+    attn_map = torch.bmm(query, key.permute(0, 2, 1)) * self.scale
+    if mask is not None : 
+      mask = mask.repeat(self.num_heads, 1, 1)
+      min_value = -torch.finfo(x.dtype).max 
+      attn_map.masked_fill(~mask, min_value)
+
+    attn_map = torch.softmax(attn_map, dim = -1) 
+    attn_map = torch.bmm(attn_map, value)
+    attn_map = attn_map.contiguous().view(B, self.num_heads, q_len, self.dims_per_head).permute(0, 2, 1, 3) 
+    attn_map = attn_map.contiguous().view(B, q_len, -1)
+    result = self.proj_out(attn_map)
+    result = self.dropout(result)
+    return result
+
+class GeGLU(nn.Module): 
+  def __init__(self, model_dim, ffn_dim): 
+    super(GeGLU, self).__init__()
+    self.proj = nn.Linear(model_dim, ffn_dim * 2)
+  def forward(self, x): 
+    x, gate = self.proj(x).chunk(2, dim = -1) 
+    return x * F.gelu(gate)
+
+class TransformerFeedForwardNetwork(nn.Module): 
+  def __init__(self, model_dim, ffn_dim, glu = False, dropout = 0.2):
+    super(TransformerFeedForwardNetwork, self).__init__()
+    self.model_dim = model_dim 
+    self.ffn_dim = ffn_dim
+    self.proj_in = GeGLU(self.model_dim, self.ffn_dim) if glu else nn.Sequential(
+      nn.Linear(model_dim, ffn_dim), 
+      nn.GELU(), 
+    )
+    self.proj_out = nn.Linear(ffn_dim, model_dim)
+    self.dropout = nn.Dropout(p = dropout)
+
+  def forward(self, x): 
+    return self.project_out(self.dropout(self.proj_in(x)))
+
+class TransformerBlock(nn.Module):
+  def __init__(
+    self, 
+    model_dim, 
+    num_heads, 
+    dims_per_head, 
+    dropout, 
+    context_dim, 
+    ffn_dim, 
+    gated_feedforward = True,
+    bias_term = False,  
+  ): 
+    super(TransformerBlock, self).__init__() 
+    self.model_dim = model_dim 
+    self.num_heads = num_heads 
+    self.dims_per_head = dims_per_head 
+    self.dropout = dropout 
+    self.context_dim = context_dim  
+    self.gated_feedforward = gated_feedforward
+    self.bias_term = bias_term
+
+    self.self_attn = TransformerSelfAttentionBlock(
+      model_dim = model_dim, 
+      num_heads = num_heads, 
+      dims_per_head = dims_per_head, 
+      dropout = dropout, 
+      bias_term = bias_term, 
+    )
+
+    self.cross_attn = TransformerCrossAttentionBlock(
+      model_dim = model_dim, 
+      context_dim = context_dim, 
+      num_heads = num_heads, 
+      dims_per_head = dims_per_head, 
+      dropout = dropout, 
+      bias_term = bias_term
+    )
+
+    self.ffn_net = TransformerFeedForwardNetwork(
+      model_dim = model_dim, 
+      ffn_dim = ffn_dim, 
+      dropout = dropout, 
+      glu = gated_feedforward, 
+    )
+
+    self.norm_a = nn.LayerNorm(model_dim)
+    self.norm_b = nn.LayerNorm(model_dim) 
+    self.norm_c = nn.LayerNorm(model_dim)
+
+  def forward(self, x, context, mask = None):   
+    x = x + self.self_attn(self.norm_a(x))
+    x = x + self.cross_attn(self.norm_b(x), context, mask) 
+    x = x + self.ffn_net(self.norm_c(x))
+    return x 
+
+class SpatialTransformer(nn.Module): 
+  def __init__(
+    self, 
+    dims, 
+    in_channels, 
+    model_dim, 
+    num_heads,
+    num_transformer_layers,  
+    dims_per_head, 
+    dropout, 
+    context_dim, 
+    ffn_dim, 
+    gated_feedforward = True,
+    bias_term = False,  
+  ):
+    super(SpatialTransformer, self).__init__()
+    self.in_channels = in_channels 
+    self.model_dim = model_dim 
+    self.num_heads = num_heads
+    self.dims_per_head = dims_per_head 
+    self.dropout = dropout 
+    self.num_transformer_layers = num_transformer_layers
+    self.context_dim = context_dim 
+    self.ffn_dim = ffn_dim 
+    self.gated_feedforward = gated_feedforward 
+    self.bias_term = bias_term 
+    self.dims = dims
+
+    self.proj_in = get_conv_by_dim(dims, self.in_channels, model_dim, kernel_size = 1, stride = 1, padding = 0) 
+    self.norm = nn.GroupNorm(num_groups = 32, num_channels = model_dim, eps = 1e-6, affine = True)
+    self.transformer_blocks = nn.ModuleList([])
+    
+    
+    for _ in range(self.num_transformer_layers):
+      self.transformer_blocks.append(TransformerBlock(
+        model_dim = model_dim, 
+        num_heads = num_heads, 
+        dims_per_head = dims_per_head, 
+        dropout = dropout, 
+        context_dim = context_dim, 
+        ffn_dim = ffn_dim, 
+        gated_feedforward = gated_feedforward, 
+        bias_term = bias_term, 
+      ))
+    
+    self.proj_out = zero_module(
+      get_conv_by_dim(dims, model_dim, self.in_channels, kernel_size = 1, stride = 1, padding = 0) 
+    )
+
+  def forward(self, x, context, mask):
+    b, c, h, w = x.shape
+    residual = x 
+    residual = self.norm(residual)
+    residual = self.proj_in(residual)
+    residual = residual.contiguous().view(b, self.model_dim, -1).permute(0, 2, 1) 
+    
+    for block in self.transformer_blocks: 
+      residual = block(residual, context, mask) 
+    
+    residual = residual.permute(0, 2, 1).contiguous().view(b, self.model_dim, h, w) 
+    residual = self.proj_out(residual)
+    return residual + x
+  
     
 class Upsample(nn.Module): 
   def __init__(self, channels, use_conv, dims = 2, out_channels = None):
@@ -340,6 +576,16 @@ class Unet(nn.Module):
     residual_block_up_down = True, 
     embedding_to_model_dim_ratio = 4,  
     device = 'cuda',       
+    use_spatial_transformer = False, 
+    train_with_context = False, 
+    transformer_model_dim = 256, 
+    transformer_context_dim = 256, 
+    transformer_num_layers = 2, 
+    transformer_num_heads = 4, 
+    transformer_dims_per_head = 64, 
+    transformer_ffn_dim = 2048, 
+    bias_term = False, 
+    gated_feedforward = True, 
   ):
     super(Unet, self).__init__()
     self.image_size = image_size 
@@ -358,7 +604,18 @@ class Unet(nn.Module):
     self.embedding_to_model_dim_ratio = embedding_to_model_dim_ratio
     self.attention_resolutions = attention_resolutions
     self.device = device
+    self.use_spatial_transformer = use_spatial_transformer 
+    self.train_with_context = train_with_context 
+    self.transformer_model_dim = transformer_model_dim, 
+    self.transformer_context_dim = transformer_context_dim, 
+    self.transformer_num_layers = transformer_num_layers, 
+    self.transformer_num_heads = transformer_num_heads, 
+    self.transformer_dims_per_head = transformer_dims_per_head 
+    self.transformer_ffn_dim = transformer_ffn_dim 
+    self.bias_term = bias_term 
+    self.gated_feedforward = gated_feedforward 
 
+    assert use_spatial_transformer == train_with_context, "In train with context mode, but does not allow cross attention"
 
     self.time_embedding_dim = model_channels * embedding_to_model_dim_ratio
 
@@ -397,10 +654,23 @@ class Unet(nn.Module):
         current_channels = int(mult_coef * model_channels)
         if attn_coef in self.attention_resolutions: 
             layers.append(
+              SpatialTransformer(
+                dims = self.dims, 
+                in_channels = current_channels, 
+                model_dim = self.transformer_model_dim, 
+                num_heads = self.transformer_num_heads, 
+                num_transformer_layers = self.transformer_num_layers,
+                dims_per_head = self.transformer_dims_per_head, 
+                dropout = self.dropout, 
+                context_dim = self.transformer_context_dim, 
+                ffn_dim = self.transformer_ffn_dim, 
+                gated_feedforward = self.gated_feedforward, 
+                bias_term = self.bias_term, 
+              ) if self.use_spatial_transformer else\
               AttentionBlock(
                 channels = current_channels, 
                 num_attention_heads = self.num_attention_heads, 
-              )
+              ) 
             )
 
         self.encoder_blocks.append(layers)
@@ -441,10 +711,25 @@ class Unet(nn.Module):
         dims = dims, 
         out_channels = current_channels, 
       ), 
-      AttentionBlock(
-        channels = current_channels,
-        num_attention_heads = self.num_attention_heads,  
-      ), 
+      ( 
+        SpatialTransformer(
+          dims = self.dims, 
+          in_channels = current_channels, 
+          model_dim = self.transformer_model_dim, 
+          num_heads = self.transformer_num_heads, 
+          num_transformer_layers = self.transformer_num_layers,
+          dims_per_head = self.transformer_dims_per_head, 
+          dropout = self.dropout, 
+          context_dim = self.transformer_context_dim, 
+          ffn_dim = self.transformer_ffn_dim, 
+          gated_feedforward = self.gated_feedforward, 
+          bias_term = self.bias_term, 
+        ) if self.use_spatial_transformer else\
+        AttentionBlock(
+          channels = current_channels, 
+          num_attention_heads = self.num_attention_heads, 
+        ) 
+      ),  
       ResidualBlock(
         channels = current_channels, 
         embedding_channels = self.time_embedding_dim, 
@@ -479,10 +764,23 @@ class Unet(nn.Module):
         current_channels = int(model_channels * mult)
         if attn_coef in attention_resolutions : 
           layers.append(
+            SpatialTransformer(
+              dims = self.dims, 
+              in_channels = current_channels, 
+              model_dim = self.transformer_model_dim, 
+              num_heads = self.transformer_num_heads, 
+              num_transformer_layers = self.transformer_num_layers,
+              dims_per_head = self.transformer_dims_per_head, 
+              dropout = self.dropout, 
+              context_dim = self.transformer_context_dim, 
+              ffn_dim = self.transformer_ffn_dim, 
+              gated_feedforward = self.gated_feedforward, 
+              bias_term = self.bias_term, 
+            ) if self.use_spatial_transformer else\
             AttentionBlock(
               channels = current_channels, 
               num_attention_heads = self.num_attention_heads, 
-            )
+            ) 
           )
                 
         if level and ind == num_residual_blocks : 
@@ -516,10 +814,15 @@ class Unet(nn.Module):
         kernel_size = 3, padding = 1)), # To reduce the instabilities in the early stage of training 
     )
 
-  def forward(self, inp, timesteps, y = None): 
+  def forward(self, inp, timesteps, context = None, mask = None, y = None): 
+    if self.num_classes is not None : 
+      assert y is not None, "The condition y cannot be None when num_classes is specified"
+
+    if self.use_spatial_transformer == True:
+      assert context is not None, "Context not found, cannot use cross attention module"
     
     embedding = self.time_embedding(timestep_embedding(timesteps, self.model_channels))
-    if self.num_classes is not None and y is not None: 
+    if self.num_classes is not None : 
       embedding = embedding + self.label_embedding(y)
 
     output_stack = [] 
@@ -530,7 +833,9 @@ class Unet(nn.Module):
         for submodule in module:
           if isinstance(submodule, ResidualBlock):
             output = submodule(output, embedding)
-          else: 
+          elif isinstance(submodule, SpatialTransformer): 
+            output = submodule(output, context, mask)
+          else : 
             output = submodule(output)
       else : 
         output = module(output)
@@ -538,10 +843,16 @@ class Unet(nn.Module):
       output_stack.append(output)
         
     for submodule in self.mid_block: 
-      if isinstance(submodule, ResidualBlock):
-        output = submodule(output, embedding)
-      else: 
-        output = submodule(output)
+      if isinstance(module, nn.ModuleList):
+        for submodule in module:
+          if isinstance(submodule, ResidualBlock):
+            output = submodule(output, embedding)
+          elif isinstance(submodule, SpatialTransformer): 
+            output = submodule(output, context, mask)
+          else : 
+            output = submodule(output)
+      else : 
+        output = module(output)
 
     for module in self.decoder_blocks : 
       output = torch.cat([output, output_stack.pop()], dim = 1)
@@ -549,7 +860,9 @@ class Unet(nn.Module):
         for submodule in module:
           if isinstance(submodule, ResidualBlock):
             output = submodule(output, embedding)
-          else: 
+          elif isinstance(submodule, SpatialTransformer): 
+            output = submodule(output, context, mask)
+          else : 
             output = submodule(output)
       else : 
         output = module(output)

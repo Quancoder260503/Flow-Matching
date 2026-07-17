@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid 
 from PIL import Image 
 from Unet import Unet
-from Transformer import DiffusionTransformer
+from DiffusionTransformer import DiffusionTransformer
 from EMA import EMAHelper
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt 
@@ -54,20 +54,18 @@ def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tens
   return torch.clip(time, min = 0.0001, max = 1.0)
 
 class ClassifierFreeGuidanceScaledModel(nn.Module):
-  def __init__(self, model : nn.Module, cfg_scale : int, labels : torch.Tensor):
+  def __init__(self, model : nn.Module, cfg_scale : float,  labels : torch.Tensor):
     self.model = model 
     self.cfg_scale = cfg_scale 
     self.labels = labels
   
   def forward(self, x : torch.Tensor, t : torch.Tensor): 
     module = self.model.module if isinstance(self.model, DDP) else self.model
-
     with torch.amp.autocast_mode(), torch.no_grad():
-      conditioned = self.model(x, t, self.label)
-      unconditioned = self.model(x, t, None) 
+      conditioned = module(x, t, self.label)
+      unconditioned = module(x, t, None) 
     result = (1 + self.cfg_scale) * conditioned - self.cfg_scale * unconditioned
     return result.to(dtype = torch.float32)
-
 
 
 class Runner(ABC):  
@@ -99,7 +97,6 @@ class Runner(ABC):
             f"{self.args.sampling_model_version}.pth"), map_location = map_loc)
       
       self.get_sampling_model()
-      self.sampling_model.load_state_dict(states[0])
       sampling_ema_helper = EMAHelper(mu = self.args.ema_rate)
       sampling_ema_helper.load_state_dict(states[5])
       sampling_ema_helper.ema(self.sampling_model) 
@@ -124,6 +121,7 @@ class Runner(ABC):
       self.start_epoch = states[3]
       self.step = states[4]
       self.ema_helper.load_state_dict(states[5])
+      
 
 
   def get_sampling_model(self):
@@ -171,10 +169,6 @@ class Runner(ABC):
     else:
       self.sampling_model = sampling_model
 
-
-  @property
-  def raw_model(self):
-    return self.model.module if self.is_ddp else self.model
   
   @abstractmethod
   def prepare_model(self):
@@ -350,9 +344,6 @@ class Runner(ABC):
       num_workers = self.args.num_workers,
     )
 
-  def train(self):
-    self.train_vector_field()
-
   @abstractmethod
   def encode_input(self, x_0, img):
     pass 
@@ -378,7 +369,7 @@ class Runner(ABC):
         self.train_sampler.set_epoch(epoch)
       losses = []
 
-      for index, (img, labels) in enumerate(self.train_loader):
+      for _, (img, labels) in enumerate(self.train_loader):
         self.step += 1
         self.model.train()
 
@@ -408,7 +399,7 @@ class Runner(ABC):
           torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad)
 
         self.optimizer.step()
-        self.ema_helper.update(self.raw_model)                 
+        self.ema_helper.update(self.model.module if self.is_ddp else self.model)                 
 
         if is_main_process(self.rank):                         
           tensorboard_logger.add_scalar('loss', loss.item(), global_step = self.step)
@@ -470,19 +461,19 @@ class Runner(ABC):
     
       
   @torch.no_grad()
-  def sample(self, labels):
+  def sample(self):
     os.makedirs(self.args.image_folder, exist_ok = True)
     img_id = 0
     num_rounds = (self.args.num_samples - img_id) // self.args.sampling_batch_size
-    self.ema_helper.ema(self.raw_model)
-    self.model.eval()
+    self.ema_helper.ema(self.ema_model)
+    self.ema_model.eval()
     for _ in tqdm.tqdm(range(num_rounds), desc = 'Generating img for evaluation'):
       shape = (self.args.sampling_batch_size, self.args.in_channels, \
                self.args.image_size, self.args.image_size)
       gaussian_noise = torch.randn(shape)
       ode_solver = self.solver_class(
-        velo_func = self.model if self.args.num_classes is None \
-          else ClassifierFreeGuidanceScaledModel(self.raw_model), 
+        velo_func = self.ema_model if self.args.num_classes is None \
+          else ClassifierFreeGuidanceScaledModel(self.ema_model, self._params['cfg_scale'], self._params['labels']), 
         y_0 = gaussian_noise, 
       )
       timesteps = torch.linspace(0, 1.0, self.args.num_sampling_steps + 1)
@@ -545,10 +536,13 @@ class UnetRunner(Runner):
       embedding_to_model_dim_ratio = self.args.embedding_to_model_dim_ratio,
     ).to(self.device)                                        
 
+
     if self.is_ddp:
       self.model = DDP(model, device_ids = [self.rank], output_device = self.rank)
+      self.ema_model = self.model.module.copy()
     else:
       self.model = model
+      self.ema_model = self.model.copy()
 
   def encode_input(self, img):
     gaussian_noise = torch.randn_like(img).to(self.args.device)
@@ -600,9 +594,12 @@ class DiTransformerRunner(Runner):
 
     if self.is_ddp:
       self.model = DDP(model, device_ids = [self.rank], output_device = self.rank)
+      self.ema_model = self.model.module.copy()
     else:
       self.model = model
+      self.ema_model = self.model.copy()
 
+ 
   def encode_input(self, img):
     with torch.no_grad():
       latent_z = self.autoencoder_kl.encode(img).sample().mul(KL_AUTOENCODER_PRECISION)
@@ -629,7 +626,7 @@ def ddp_worker(rank: int, world_size: int, args):
   setup_ddp(rank, world_size)
   try:
     runner = UnetRunner(args, rank = rank, world_size = world_size) if args.model == 'unet'\
-        else DiffusionTransformer(args, rank = rank, world_size = world_size)
+        else DiTransformerRunner(args, rank = rank, world_size = world_size)
     if args.train:
       runner.train()
     else:
@@ -646,7 +643,7 @@ def launch(args):
   if world_size > 1:
     mp.spawn(ddp_worker, args = (world_size, args), nprocs = world_size, join = True)
   else:
-    runner = UnetRunner(args) if args.model == 'unet' else DiffusionTransformer(args)
+    runner = UnetRunner(args) if args.model == 'unet' else DiTransformerRunner(args)
     if args.train:
       runner.train()
     else:
